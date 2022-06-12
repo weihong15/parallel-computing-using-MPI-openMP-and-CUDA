@@ -1,0 +1,55 @@
+Starting at Tue Apr 19 09:20:32 UTC 2022
+
+g++ -std=c++11 -g -Wall -O3 -fopenmp main_q2.cpp -o main_q2
+g++ -std=c++11 -g -Wall -O3 -fopenmp main_q2.cpp -D QUESTION6 -o main_q2_part6
+
+Output from main_q1
+----------------
+Parallel
+Sum Even: 757361650
+Sum Odd: 742539102
+Time: 0.0742298
+Serial
+Sum Even: 757361650
+Sum Odd: 742539102
+Time: 0.0335585
+main_q1.cpp:60:main	TEST PASSED.
+
+Output from main_q2
+----------------
+tests_q2.h:22:Test1	TEST PASSED.
+tests_q2.h:38:Test2	TEST PASSED.
+tests_q2.h:50:Test3	TEST PASSED.
+tests_q2.h:67:Test4	TEST PASSED.
+tests_q2.h:84:Test5	TEST PASSED.
+Serial Radix Sort: PASS
+Parallel Radix Sort: PASS
+stl: 0.309602
+serial radix: 0.0455337
+parallel radix: 0.0561751
+
+Output from main_q2_part6
+----------------
+tests_q2.h:22:Test1	TEST PASSED.
+tests_q2.h:38:Test2	TEST PASSED.
+tests_q2.h:50:Test3	TEST PASSED.
+tests_q2.h:67:Test4	TEST PASSED.
+tests_q2.h:84:Test5	TEST PASSED.
+Serial Radix Sort: PASS
+Parallel Radix Sort: PASS
+stl: 0.311142
+serial radix: 0.0442324
+parallel radix: 0.051594
+Threads Blocks / Timing
+         1       2       4       8      12      16      24      32      40      48
+   1    0.052   0.052   0.054   0.056   0.060   0.061   0.066   0.072   0.073   0.076
+   2    0.053   0.047   0.048   0.048   0.053   0.051   0.056   0.058   0.061   0.068
+   4    0.053   0.047   0.046   0.047   0.051   0.051   0.054   0.055   0.057   0.066
+   8    0.051   0.047   0.045   0.047   0.051   0.049   0.054   0.055   0.060   0.067
+  12    0.052   0.047   0.047   0.047   0.054   0.053   0.055   0.057   0.060   0.070
+  16    0.050   0.047   0.045   0.047   0.053   0.051   0.054   0.062   0.062   0.068
+  24    0.050   0.047   0.046   0.047   0.053   0.051   0.057   0.057   0.061   0.070
+  32    0.050   0.047   0.045   0.048   0.055   0.053   0.057   0.061   0.062   0.070
+  40    0.052   0.047   0.047   0.048   0.054   0.051   0.059   0.059   0.063   0.071
+  48    0.052   0.048   0.047   0.048   0.053   0.051   0.058   0.059   0.064   0.072
+Benchmark runs: PASS

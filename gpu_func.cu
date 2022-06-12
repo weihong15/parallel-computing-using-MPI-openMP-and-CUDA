@@ -1,0 +1,441 @@
+#include "gpu_func.h"
+#include <cuda_runtime.h>
+#include <helper_cuda.h>
+#include <helper_functions.h>
+#include <iostream>
+#include "cublas_v2.h"
+
+/*
+Routine to perform an in-place GEMM operation, i.e., C := alpha*A*B + beta*C
+*/
+
+int BLOCK_SIZE = 32;
+int NUM_THREADS = 256;
+
+void copy2GPUwrap(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real* alpha, nn_real* beta,
+           int M, int N, int K) {
+	nn_real* d_A;nn_real* d_B; nn_real* d_C;
+	//A is size M,K, //B is size K N, C is size M,N
+	cudaMalloc(&d_A, sizeof(nn_real)*M*K);
+	cudaMalloc(&d_B, sizeof(nn_real)*K*N);
+	cudaMalloc(&d_C, sizeof(nn_real)*M*N);
+
+	//writing back to C, so we don't need d_out
+	
+	//copying
+	cudaMemcpy(d_A,A, sizeof(nn_real)*M*K, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_B,B, sizeof(nn_real)*N*K, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_C,C, sizeof(nn_real)*M*N, cudaMemcpyHostToDevice);
+
+	check_launch("copy to gpu GEMM");
+
+	//this will be a wrapper
+	//change below for different GEMM
+	//GPU code here.
+	myGEMM2(d_A,d_B,d_C, alpha, beta,M,N,K);
+	
+	//overwrite current C with d_C
+	cudaMemcpy(C,d_C,sizeof(nn_real)*M*N,cudaMemcpyDeviceToHost);
+
+	check_launch("copy from gpu GEMM");
+
+	cudaFree(d_A);
+	cudaFree(d_B);
+	cudaFree(d_C);
+           }
+
+__global__
+void GPU_GEMM_noob(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real alpha, nn_real beta,
+           int M, int N, int K){
+	// alpha*AB +beta * C
+	int row = blockIdx.x*blockDim.x+threadIdx.x;
+	int col = blockIdx.y*blockDim.y+threadIdx.y;
+	if (row<M && col < N){
+	//dot product of A[row] and B[col],
+		int ind = M* col + row;;
+		nn_real cumm = 0.0;
+		for(int i = 0;i<K;i++) cumm += alpha*A[M*i+row]*B[K*col+i];
+			//cumm += alpha*A[row*N+i] *B[col+i*N];
+		cumm+= beta*C[ind];
+		C[ind] = cumm;
+
+	}
+}
+
+__global__
+void GPU_GEMM_amateur(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real alpha, nn_real beta,
+           int M, int N, int K){
+        // alpha*AB +beta * C
+        // 
+        const int BLOCK_SIZE=32;
+        nn_real total = 0.0;
+        int iter = (K+BLOCK_SIZE-1)/BLOCK_SIZE;
+//each thread will handle the row and column of the C matrix calculation
+        //true index
+        int globalX = blockIdx.x* blockDim.x + threadIdx.x;
+        int globalY = blockIdx.y* blockDim.y+ threadIdx.y;
+// we load shared memory, this square matrix is utilized but all people in thread
+
+	//int subBlocks = (K+blockDim.y-1)/blockDim.y;
+	__shared__ nn_real A_[BLOCK_SIZE][BLOCK_SIZE];
+	__shared__ nn_real B_[BLOCK_SIZE][BLOCK_SIZE];
+	
+	int colOne,rowOne,colTwo,rowTwo,indOne,indTwo;
+
+	for (int i =0; i< iter; i++){
+		//2 points one for A, one for B
+		colOne = i*BLOCK_SIZE+threadIdx.x;
+		rowOne = globalY;
+		colTwo = globalX;
+		rowTwo = i*BLOCK_SIZE + threadIdx.y;
+
+		indOne = colOne*M+rowOne;
+		indTwo = colTwo*K+rowTwo;
+
+		if (colOne<K)A_[threadIdx.y][threadIdx.x] = A[indOne];
+		else A_[threadIdx.y][threadIdx.x] = 0.0;
+
+		if (rowTwo<K)B_[threadIdx.y][threadIdx.x] = B[indTwo];
+		else B_[threadIdx.y][threadIdx.x] = 0.0;
+
+                __syncthreads();
+
+		if(globalX<N && globalY<M){
+			for(int j=0; j<blockDim.y;j++) total+= A_[threadIdx.y][j]*B_[j][threadIdx.x];
+		}
+
+        }
+
+        //
+        //if(threadIdx.x<M && threadIdx.y<N) C[globalY*M+globalX] = alpha*total +beta*C[globalY*M+globalX];
+	if(globalX<N && globalY<M) C[globalX*M+globalY] = alpha*total+beta*C[globalX*M+globalY];
+}
+/*
+        if (row<M && col < N){
+        //dot product of A[row] and B[col],
+                int ind = M* col + row;;
+                nn_real cumm = 0.0;
+                for(int i = 0;i<K;i++) cumm += alpha*A[M*i+row]*B[K*col+i];
+                        //cumm += alpha*A[row*N+i] *B[col+i*N];
+                cumm+= beta*C[ind];
+                C[ind] = cumm;
+
+        } */
+
+__global__
+void GPU_GEMM_amateur2(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real alpha, nn_real beta,
+           int M, int N, int K){
+	// alpha*AB +beta * C
+	// 
+	const int BLOCK_SIZE=32;
+	double total = 0.0;
+	int iter = (K+BLOCK_SIZE-1)/BLOCK_SIZE;
+//each thread will handle the row and column of the C matrix calculation
+	//true index
+	int globalX = blockIdx.x* blockDim.x + threadIdx.x;
+	int globalY = blockIdx.y* blockDim.y+ threadIdx.y;
+// we load shared memory, this square matrix is utilized but all people in thread
+	for (int i =0; i< iter; i++){
+		__shared__ double A_[BLOCK_SIZE][BLOCK_SIZE+1];
+		__shared__ double B_[BLOCK_SIZE][BLOCK_SIZE+1];
+
+		int colA = BLOCK_SIZE*i+threadIdx.y;
+		if (globalX< M && colA< K) A_[threadIdx.x][threadIdx.y] = A[M*colA+globalX];
+		int rowB = threadIdx.x+BLOCK_SIZE*i;
+		if (globalY<N && rowB<K) B_[threadIdx.x][threadIdx.y] = B[N*rowB+globalY];
+
+		__syncthreads();
+
+		//num_elements is normally 32, unless it towards the end.
+		int num_ele = BLOCK_SIZE;
+		if ((K-i*BLOCK_SIZE)<BLOCK_SIZE) num_ele= K-i*BLOCK_SIZE;
+		//accumualte the total matrix multiplication
+		for (int j=0;j<num_ele;j++) total+= A_[threadIdx.x][j]*B_[j][threadIdx.y];
+
+	__syncthreads();
+	}
+
+	//
+	if(threadIdx.x<M && threadIdx.y<N) C[globalY*M+globalX] = alpha*total +beta*C[globalY*M+globalX];
+
+/*
+	if (row<M && col < N){
+	//dot product of A[row] and B[col],
+		int ind = M* col + row;;
+		nn_real cumm = 0.0;
+		for(int i = 0;i<K;i++) cumm += alpha*A[M*i+row]*B[K*col+i];
+			//cumm += alpha*A[row*N+i] *B[col+i*N];
+		cumm+= beta*C[ind];
+		C[ind] = cumm;
+
+	} */
+}
+
+/*
+  Caller function GEMM
+*/
+
+int myGEMM(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real* alpha, nn_real* beta,
+           int M, int N, int K) {
+
+    // size of C is MN, so we need at least MN threads working
+	dim3 block(BLOCK_SIZE, NUM_THREADS/BLOCK_SIZE);
+	int block_X_PerGrid = (M+block.x-1)/block.x;
+	int block_Y_PerGrid = (N +block.y-1)/block.y;
+	dim3 grid(block_X_PerGrid,block_Y_PerGrid);
+	
+	GPU_GEMM_noob<<<grid,block>>>(A,B,C, *alpha, *beta,M,N,K);
+    return 0;
+}
+
+int myGEMM2(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real* alpha, nn_real* beta,
+           int M, int N, int K) {
+
+			   //attempt to implement 4.2. even better gemm in project document
+	dim3 block(32,32);
+	int block_X_PerGrid = (N+block.x-1)/block.x;
+	int block_Y_PerGrid = (M +block.y-1)/block.y;
+	dim3 grid(block_X_PerGrid,block_Y_PerGrid);
+
+	GPU_GEMM_amateur<<<grid,block>>>(A,B,C, *alpha, *beta,M,N,K);
+    return 0;
+}
+
+/* GEMM out-of-place, transpose 2nd: D := alpha*A*B.T + beta*C */
+__global__ 
+void kernel_oop_gemm_t2(nn_real* __restrict__ A, 
+                        nn_real* __restrict__ B, 
+                        nn_real* __restrict__ C, 
+                        nn_real* __restrict__ D,
+                        nn_real alpha, nn_real beta, 
+                        int M, int N, int K) 
+{
+    // Index of thread within the matrix as a whole
+    int trow = (threadIdx.y*blockDim.x) + threadIdx.x;
+    int row = trow + blockIdx.y*blockDim.y*blockDim.x;
+    int col = blockIdx.x*numXPerThread;
+
+    // Shared memory stores B sub-matrix 4x16
+    __shared__ nn_real Bs[BLOCKDIM_Y*BLOCKDIM_X];
+
+    // Local memory register stores A sub-matrix 1x4 
+    nn_real Dvals[16] = {};
+    nn_real a[4] = {};
+
+    // Loop over all sub-matrices of A and B required to 
+    // compute Csub 64x16. Multiply together and accumulate results
+    for (int m = 0; m < (K + BLOCKDIM_Y - 1) / BLOCKDIM_Y; ++m) 
+    {
+        // Load Bsub from device memory into shared memory. 
+        // Each thread loads one element of each sub-matrix
+        int B_col = threadIdx.x; int B_row = threadIdx.y;
+        if (m*BLOCKDIM_Y + B_row < K && col + B_col < N) {
+            Bs[B_row + BLOCKDIM_Y * B_col] = B[(m*BLOCKDIM_Y + B_row)*N + (col + B_col)];
+        }
+        
+        // Load A 1x4 sub matrix into local memory
+        // Each thread loads 1x4 array into register
+        if (row < M) {
+            for (int j = 0; j < BLOCKDIM_Y; ++j) {
+                if ((m*BLOCKDIM_Y + j) < K) {
+                    a[j] = A[row + (m*BLOCKDIM_Y + j)*M];
+                }
+            }
+        }
+        // Synchronize to make sure the sub-matrices are loaded
+        __syncthreads(); 
+
+        // Multiply a[4] with Bsub to get 1x16 row of A*B 
+        for (int i = 0; i < numXPerThread; ++i) {
+            for (int j = 0; j < BLOCKDIM_Y; ++j) {
+                if (col + i < N && row < M && (m*BLOCKDIM_Y + j) < K) {
+                    Dvals[i] += a[j] * Bs[j + i*BLOCKDIM_Y];
+                }
+            }
+        }
+        // Synchronize before loading two new sub matrices
+        __syncthreads();
+    }
+
+    // Each thread updates 1x16 row to output matrix
+    for (int i = 0; i < numXPerThread; ++i) {
+        if (row < M && (col+i) < N) {
+            D[row + (col+i)*M] = alpha*Dvals[i] + beta*C[row + (col+i)*M];
+        }
+    }  
+}
+
+
+__global__
+void GPU_GEMM_brandNew(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real alpha, nn_real beta,
+           int M, int N, int K){
+
+			   int temp = ( blockDim.x * threadIdx.y) + threadIdx.x;
+			   int row = blockDim.x * blockDim.y *blockIdx.y + temp;
+			   int col = 16* blockIdx.x;
+
+			//Within each iteration,  a 4×16 sub-matrix ofBis loaded into the thread block’sshared memory,
+			__shared__ nn_real B_[64]
+
+			//Each thread then reads in a 1×4 sub-matrixofAinto a local arraya[4],
+			nn_real a_[4] = {};
+
+			//Each thread computes a row of size 1×16 in the outputD.
+			nn_real d_[16] = {};
+
+			// each 16X4 block need to compute a 64X16 matrix
+			// first store shared memory
+			for (int i = 0;i <(K+3)/4;i++){
+				
+				//storage for shared memory
+				//each thread store 1, 16X4, need 64 shared
+				//threadIdx.y + 4*threadIdx.x --> 0-63
+				// global wise, i am confused???
+				// each ith is within some 16 subblock,
+				int global_row_B = i * 4+threadIdx.y;
+				int global_col_B = col +threadIdx.x;
+				int global_ind_B = N*global_row_b + global_col_B;
+				if (global_row_B<K && global_col_B < N) B_[threadIdx.y+4*threadIdx.x] = B[global_ind_B];
+
+
+				//Each thread then reads in a 1×4 sub-matrixofAinto a local arraya[4],
+				if (row<M){
+					for (int j=0; j<4;j++)a_[j] = A[row+M*(4*i+j)];
+				}
+
+				//sync threads, to ensure shared memory is stored properly
+				__syncthreads();
+
+				//each a[4] will multiply by b shared to get 16 elements.
+				for(int j = 0; j<16; j++){
+					//k is confusing, change ind to ij
+					for(int ij = 0; ij < 4; ij++){
+						if(row<M && (4*i+ij)<K && (col+j)<N)
+							d_[j]+=a_[ij]*B_[4*j+ij];
+					}
+				}
+				__syncthreads();
+			}
+			//now we got true value of AB for 16 elements, we need to write back to C
+			for(int i = 0;i<16;i++){
+				if (row<M &&(col+i)<N)
+					C[row+(col+i)*M] = alpha*d_[i]+beta*C[row+(col+i)*M];
+			}
+		   }
+
+//attempt to follow part 1 notes 16*4 blocks
+//16*4 blocks will compute 64X16
+int brandNewGeMM(nn_real* __restrict__ A, nn_real* __restrict__ B,
+           nn_real* __restrict__ C, nn_real* alpha, nn_real* beta,
+           int M, int N, int K) {
+			dim3 block(16,4);
+			int block_X_PerGrid = (N+15)/16;
+			int block_Y_PerGrid = (M +63)/64;
+			dim3 grid(block_X_PerGrid,block_Y_PerGrid);
+			GPU_GEMM_brandNew<<<grid,block>>>(A,B,C, *alpha, *beta,M,N,K);
+    		return 0;
+		   }
+
+
+
+
+
+//other people
+int caller_oop_gemm_t2(nn_real* __restrict__ A, 
+                       nn_real* __restrict__ B,
+                       nn_real* __restrict__ C, 
+                       nn_real* __restrict__ D,
+                       nn_real alpha, nn_real beta,
+                       int M, int N, int K) 
+{
+    // Thread block, grid dimensions
+    dim3 dimBlock(BLOCKDIM_X, BLOCKDIM_Y);  // specifc for this implementation
+    int xblocks = (N + numXPerThread - 1) / numXPerThread;
+    int yblocks = (M + (BLOCKDIM_X*BLOCKDIM_Y) - 1) / (BLOCKDIM_X*BLOCKDIM_Y);
+    dim3 dimGrid(xblocks, yblocks);
+
+    // Launch matrix-multiplication kernel
+    kernel_oop_gemm_t2<<<dimGrid, dimBlock>>>(A, B, C, D, alpha, beta, M, N, K); 
+
+    return 0;
+}
+
+
+/* Helper functions for neural networks */
+// TODO
+
+__global__
+void gpu_sigmoid_noob(nn_real* v,int M, int N){
+        int row = threadIdx.x+blockIdx.x*blockDim.x;
+        int col = threadIdx.y+blockIdx.y*blockDim.y;
+        if (row<M && col<N) v[row+col*M] = 1/(1+exp(-v[row+col*M]));
+}
+
+void my_sigmoid(nn_real* v, nn_real* u, int M, int N){
+	//will do sigmoid on vector v
+	//store the output from GPU in u
+	nn_real* d_u = nullptr;
+	cudaMalloc(&d_u,M*N*sizeof(nn_real));
+	cudaMemcpy(d_u,v, M*N*sizeof(nn_real), cudaMemcpyHostToDevice);
+	check_launch("copy to gpu");
+	dim3 block(BLOCK_SIZE, NUM_THREADS/BLOCK_SIZE);
+        int block_X_PerGrid = (M+block.x-1)/block.x;
+        int block_Y_PerGrid = (N +block.y-1)/block.y;
+        dim3 grid(block_X_PerGrid,block_Y_PerGrid);
+		
+	//kernel
+	gpu_sigmoid_noob<<<grid,block>>>(d_u,M,N);
+	cudaMemcpy(u,d_u,M*N*sizeof(nn_real),cudaMemcpyDeviceToHost);
+	check_launch("copy from gpu whyyyyy???");
+	cudaFree(d_u);	
+}
+
+__global__
+void gpu_softmax_noob(nn_real* v,int M,int N){
+	//softmax every col
+	int col = threadIdx.x + blockIdx.x*blockDim.x;
+	while (col<N){
+	nn_real cumm = 0.00;
+	for (int i = 0; i<M;i++){
+		//exponential the whole column
+		//store the sum, and divide the whole column
+		//int ind = M*col+ i;
+		//v[ind] = exp(v[ind]);
+		//cumm += v[ind];
+
+		int ind = col*M+i;
+		v[ind] = exp(v[ind]);
+		cumm += v[ind];
+
+	}
+	for (int i = 0;i<M;i++) v[col*M+i]/=cumm;
+
+//	printf("finish with column %d",col);
+	col += blockDim.x*gridDim.x;
+	}
+}
+
+
+void my_softmax(nn_real* u, nn_real* v, int M, int N){
+//soft max each column of matrix u, size M,N
+	nn_real* d_v = nullptr;
+        cudaMalloc(&d_v,M*N*sizeof(nn_real));
+        cudaMemcpy(d_v,u, M*N*sizeof(nn_real), cudaMemcpyHostToDevice);
+	check_launch("copy to gpu softmax");
+	int block_per_grid = (N+BLOCK_SIZE-1)/BLOCK_SIZE;
+
+        //kernel
+        gpu_softmax_noob<<<block_per_grid,BLOCK_SIZE>>>(d_v,M,N);
+	check_launch("mid point");
+	//printf("two values M = %d, N= %d",M,N);
+        cudaMemcpy(v,d_v,M*N*sizeof(nn_real),cudaMemcpyDeviceToHost);
+        check_launch("copy from gpu softmax");
+	cudaFree(d_v);
+}
